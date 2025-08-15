@@ -48,7 +48,7 @@
     <p>
         <span style="font-variant: small-caps;"><strong>STream3R</strong></span> reformulates dense 3D reconstruction into a sequential registration task with causal attention.
         <br>
-        <i>⭐ Now supports <b>FlashAttention</b>, <b>KV Cache</b>, <b>Causal Attention</b>, <b>Window Attention</b>, and <b>Full Attention</b>!</i>
+        <i>⭐ Now supports <b>FlashAttention</b>, <b>KV Cache</b>, <b>Causal Attention</b>, <b>Sliding Window Attention</b>, and <b>Full Attention</b>!</i>
     </p>
     <img width="820" alt="pipeline" src="assets/teaser_dynamic.gif">
     :open_book: See more visual results on our <a href="https://nirvanalan.github.io/projects/stream3r" target="_blank">project page</a>
@@ -104,7 +104,7 @@
 ## :computer: Inference
 You can now try STream3R with the following code. The checkpoint will be downloaded automatically from [Hugging Face](https://huggingface.co/yslan/STream3R). 
 
-You can set the inference mode to `causal` for causal attention, `window` for window attention, or `full` for bidirectional attention.
+You can set the inference mode to `causal` for causal attention, `window` for sliding window attention (with a default window size of 5), or `full` for bidirectional attention.
 
 ```python
 import os
@@ -202,7 +202,7 @@ Read our [full paper](https://arxiv.org/abs/2508.10893) for more insights.
 
 ## GPU Memory Usage and Runtime
 
-We report the peak GPU memory usage (VRAM) and runtime of our full model for processing each streaming input using the `StreamSession` implementation. All experiments were conducted at a common resolution of 518 × 384 on a single H200 GPU.
+We report the peak GPU memory usage (VRAM) and runtime of our full model for processing each streaming input using the `StreamSession` implementation. All experiments were conducted at a common resolution of 518 × 384 on a single H200 GPU. The benchmark includes both *Causal* for causal attention and *Window* for sliding window attention with a window size of 5.
 
 
 *Run Time (s).*
