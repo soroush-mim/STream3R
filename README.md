@@ -239,7 +239,7 @@ This project is licensed under <a rel="license" href="./LICENSE">NTU S-Lab Licen
 If you find our code or paper helps, please consider citing:
 
 ```bibtex
-@inproceedings{stream3r2025,
+@article{stream3r2025,
   title={STream3R: Scalable Sequential 3D Reconstruction with Causal Transformer},
   author={Lan, Yushi and Luo, Yihang and Hong, Fangzhou and Zhou, Shangchen and Chen, Honghua and Lyu, Zhaoyang and Yang, Shuai and Dai, Bo and Loy, Chen Change and Pan, Xingang},
   booktitle={arXiv preprint arXiv:2508.10893},
