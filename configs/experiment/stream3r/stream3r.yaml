@@ -24,7 +24,7 @@ logger:
 
 data:
   data_scaling: 1.0
-  data_root: /home/yushi.lan/cut3r_data
+  data_root: /data
   num_views: 24
   resolution:
     - [518, 392]

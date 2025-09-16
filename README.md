@@ -236,7 +236,7 @@ We report the peak GPU memory usage (VRAM) and runtime of our full model for pro
 
 3. Launch training with:
     ```bash
-    python fast3r/train.py experiment=stream3r/stream3r
+    python stream3r/train.py experiment=stream3r/stream3r
     ```
 
 4. After training, you can convert the checkpoint into a `state_dict` file, for example:
