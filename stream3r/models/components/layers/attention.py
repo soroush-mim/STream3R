@@ -57,15 +57,15 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-        
+
         if kv_cache is not None:
+            
             k_cache, v_cache = kv_cache
             if k_cache is not None and v_cache is not None:
                 k = torch.cat([k_cache, k], dim=2)
                 v = torch.cat([v_cache, v], dim=2)
-            kv_cache = [k, v]
 
-        if self.fused_attn:
+        if self.fused_attn and kv_cache is None:
             x = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -91,7 +91,8 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
 
         if kv_cache is not None:
-            return x, kv_cache
+            # Return [k, v, attn_weights] for token eviction
+            return x, [k, v, attn]
 
         return x
 
