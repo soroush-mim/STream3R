@@ -11,6 +11,7 @@ This script demonstrates:
 import os
 import torch
 import time
+import numpy as np
 from stream3r.models.stream3r import STream3R
 from stream3r.stream_session import StreamSession
 from stream3r.models.components.utils.load_fn import load_and_preprocess_images
@@ -35,12 +36,112 @@ def get_cache_tokens(session):
             token_counts.append(0)
     return token_counts
 
+def save_pointmap(predictions, output_dir, prefix="pointmap"):
+    """
+    Save point cloud from predictions to PLY file.
+
+    Args:
+        predictions: Dictionary with 'world_points', 'world_points_conf', 'images'
+        output_dir: Directory to save output files
+        prefix: Prefix for output filenames
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Extract data
+    world_points = predictions['world_points']  # [B, S, H, W, 3]
+    world_points_conf = predictions['world_points_conf']  # [B, S, H, W]
+    images = predictions['images']  # [B, S, 3, H, W]
+
+    B, S, H, W, _ = world_points.shape
+
+    # Convert to numpy
+    points = world_points.cpu().numpy()  # [B, S, H, W, 3]
+    conf = world_points_conf.cpu().numpy()  # [B, S, H, W]
+    imgs = images.cpu().numpy()  # [B, S, 3, H, W]
+
+    # Process each batch and sequence
+    for b in range(B):
+        for s in range(S):
+            # Get points for this frame
+            pts = points[b, s].reshape(-1, 3)  # [H*W, 3]
+            confidence = conf[b, s].reshape(-1)  # [H*W]
+
+            # Get RGB colors (convert from [3, H, W] to [H*W, 3])
+            rgb = imgs[b, s].transpose(1, 2, 0).reshape(-1, 3)  # [H*W, 3]
+            rgb = (rgb * 255).astype(np.uint8)  # Convert to 0-255
+
+            # Filter by confidence threshold
+            conf_threshold = 0.5
+            valid_mask = confidence > conf_threshold
+
+            pts_filtered = pts[valid_mask]
+            rgb_filtered = rgb[valid_mask]
+
+            # Save to PLY
+            output_file = os.path.join(output_dir, f"{prefix}_b{b}_frame{s:03d}.ply")
+            save_ply(pts_filtered, rgb_filtered, output_file)
+            print(f"Saved pointmap: {output_file} ({len(pts_filtered)} points)")
+
+    # Also save combined point cloud for all frames
+    all_points = []
+    all_colors = []
+
+    for b in range(B):
+        for s in range(S):
+            pts = points[b, s].reshape(-1, 3)
+            confidence = conf[b, s].reshape(-1)
+            rgb = imgs[b, s].transpose(1, 2, 0).reshape(-1, 3)
+            rgb = (rgb * 255).astype(np.uint8)
+
+            valid_mask = confidence > 0.5
+            all_points.append(pts[valid_mask])
+            all_colors.append(rgb[valid_mask])
+
+    if len(all_points) > 0:
+        all_points = np.concatenate(all_points, axis=0)
+        all_colors = np.concatenate(all_colors, axis=0)
+
+        combined_file = os.path.join(output_dir, f"{prefix}_combined.ply")
+        save_ply(all_points, all_colors, combined_file)
+        print(f"Saved combined pointmap: {combined_file} ({len(all_points)} points)")
+
+def save_ply(points, colors, filename):
+    """
+    Save point cloud to PLY file.
+
+    Args:
+        points: [N, 3] numpy array of XYZ coordinates
+        colors: [N, 3] numpy array of RGB colors (0-255)
+        filename: Output PLY file path
+    """
+    assert points.shape[0] == colors.shape[0], "Points and colors must have same length"
+
+    with open(filename, 'w') as f:
+        # Write header
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        # Write vertices
+        for i in range(len(points)):
+            f.write(f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} ")
+            f.write(f"{colors[i, 0]} {colors[i, 1]} {colors[i, 2]}\n")
+
 def test_compression(
     example_dir="examples/static_room",
     num_frames=10,
     eviction_ratios=[0.0, 0.3, 0.5],
     mode="causal",
-    model_path=None
+    model_path=None,
+    save_pointmaps=False,
+    output_dir="./output_pointmaps"
 ):
     """
     Test KV compression with different eviction ratios.
@@ -51,6 +152,8 @@ def test_compression(
         eviction_ratios: List of eviction ratios to test
         mode: Attention mode ('causal' or 'window')
         model_path: Local path to pretrained model (optional)
+        save_pointmaps: Whether to save point clouds to PLY files
+        output_dir: Directory to save pointmap files
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -143,6 +246,13 @@ def test_compression(
         print(f"  Final cache size: {cache_sizes[-1]:.2f}MB")
         print(f"  Final token count (layer 0): {token_counts_per_frame[-1]}")
 
+        # Save pointmaps if requested
+        if save_pointmaps:
+            print(f"\nSaving pointmaps...")
+            final_predictions = session.get_all_predictions()
+            pointmap_dir = os.path.join(output_dir, f"eviction_{eviction_ratio:.1f}")
+            save_pointmap(final_predictions, pointmap_dir, prefix=f"pointmap_ratio{eviction_ratio:.1f}")
+
         session.clear()
 
     # Compare results
@@ -168,7 +278,7 @@ def test_compression(
 
     return results
 
-def quick_test(model_path=None):
+def quick_test(model_path=None, save_pointmaps=False):
     """Quick test to verify the implementation works."""
     print("Running quick test...")
 
@@ -193,6 +303,12 @@ def quick_test(model_path=None):
         for i in range(images.shape[0]):
             preds = session.forward_stream(images[i:i+1])
             print(f"Frame {i+1}: depth shape = {preds['depth'].shape}")
+
+    # Save pointmaps if requested
+    if save_pointmaps:
+        print("\nSaving pointmaps...")
+        final_predictions = session.get_all_predictions()
+        save_pointmap(final_predictions, "./output_pointmaps/quick_test", prefix="quick_test")
 
     print("✓ Quick test passed!")
     session.clear()
@@ -226,11 +342,24 @@ if __name__ == "__main__":
 
     # Parse command line arguments
     model_path = None
+    save_pointmaps = False
+    output_dir = "./output_pointmaps"
+
     if "--model_path" in sys.argv:
         idx = sys.argv.index("--model_path")
         if idx + 1 < len(sys.argv):
             model_path = sys.argv[idx + 1]
             print(f"Using model from: {model_path}")
+
+    if "--save_pointmaps" in sys.argv:
+        save_pointmaps = True
+        print("Will save pointmaps to PLY files")
+
+    if "--output_dir" in sys.argv:
+        idx = sys.argv.index("--output_dir")
+        if idx + 1 < len(sys.argv):
+            output_dir = sys.argv[idx + 1]
+            print(f"Output directory: {output_dir}")
 
     if "--download" in sys.argv:
         # Download model to specified directory
@@ -243,7 +372,7 @@ if __name__ == "__main__":
 
     if "quick" in sys.argv:
         # Quick test
-        quick_test(model_path=model_path)
+        quick_test(model_path=model_path, save_pointmaps=save_pointmaps)
     else:
         # Full comparison test
         results = test_compression(
@@ -251,5 +380,7 @@ if __name__ == "__main__":
             num_frames=10,
             eviction_ratios=[0.0, 0.3, 0.5],
             mode="causal",
-            model_path=model_path
+            model_path=model_path,
+            save_pointmaps=save_pointmaps,
+            output_dir=output_dir
         )
