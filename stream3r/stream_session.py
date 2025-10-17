@@ -1,5 +1,6 @@
 import torch
 from stream3r.models.stream3r import STream3R
+from stream3r.models.components.utils.kv_cache_compression_v2 import LayerWiseKVCompression
 
 
 class StreamSession:
@@ -10,9 +11,13 @@ class StreamSession:
         self,
         model: STream3R,
         mode: str,
+        num_frames: int,
         use_kv_compression: bool = False,
         eviction_ratio: float = 0.3,
         importance_aggregation: str = 'sum',
+        use_layerwise_eviction: bool = False,
+        budget_ratio: float = 0.5,
+        temp: float = 0.5,
     ):
         """
         Initialize streaming session with optional KV cache compression.
@@ -20,27 +25,40 @@ class StreamSession:
         Args:
             model: STream3R model
             mode: Attention mode ('causal' or 'window')
-            use_kv_compression: Enable token eviction for memory reduction
-            eviction_ratio: Fraction of evictable tokens to remove (0.3 = remove 30%)
-            importance_aggregation: How to compute token importance ('sum', 'max', 'mean')
+            num_frames: Total number of frames in the video
+            use_kv_compression: Enable token eviction for memory reduction (old algorithm)
+            eviction_ratio: Fraction of evictable tokens to remove (0.3 = remove 30%) [old algorithm]
+            importance_aggregation: How to compute token importance ('sum', 'max', 'mean') [old algorithm]
+            use_layerwise_eviction: Use StreamVGGT-style layer-wise eviction (recommended)
+            budget_ratio: P in formula - percentage of total frames to keep (0.5 = 50% budget)
+            temp: Temperature for layer importance softmax
         """
         self.model = model
         self.mode = mode
-
 
         self.aggregator_kv_cache_depth = model.aggregator.depth
         self.camera_head_kv_cache_depth = model.camera_head.trunk_depth
         self.camera_head_iterations = 4
 
-        # KV cache compression settings
-        self.use_kv_compression = use_kv_compression
+        # KV cache compression settings (old algorithm)
+        self.use_kv_compression = use_kv_compression and not use_layerwise_eviction
         self.eviction_ratio = eviction_ratio
         self.importance_aggregation = importance_aggregation
+
+        # Layer-wise eviction settings (new StreamVGGT algorithm)
+        self.use_layerwise_eviction = use_layerwise_eviction
+        self.budget_ratio = budget_ratio
+        self.temp = temp
 
         # Calculate tokens per frame based on model configuration
         # This will be set after first forward pass when we know image size
         self.tokens_per_frame = None
         self.patch_start_idx = model.aggregator.patch_start_idx
+        self.num_frames = num_frames
+        self.num_frames_processed = 0
+
+        # Layer-wise compression manager (initialized after first frame)
+        self.layerwise_compressor: LayerWiseKVCompression = None
 
         if self.mode not in ["causal", "window"]:
             raise ValueError(f"Unsupported attention mode when using kv_cache: {self.mode}")
@@ -113,9 +131,30 @@ class StreamSession:
             h, w = self.predictions["depth"].shape[2], self.predictions["depth"].shape[3]
             self.tokens_per_frame = h * w // self.model.aggregator.patch_size // self.model.aggregator.patch_size + self.model.aggregator.patch_start_idx
 
+            # Initialize layer-wise compressor now that we know tokens_per_frame
+            if self.use_layerwise_eviction:
+                device = aggregator_kv_cache_list[0][0].device
+                self.layerwise_compressor = LayerWiseKVCompression(
+                    num_layers=self.aggregator_kv_cache_depth,
+                    tokens_per_frame=self.tokens_per_frame,
+                    patch_start_idx=self.patch_start_idx,
+                    total_frames=self.num_frames,
+                    budget_ratio=self.budget_ratio,
+                    temp=self.temp,
+                    device=device
+                )
+                print(f"✓ Initialized LayerWiseKVCompression: {self.aggregator_kv_cache_depth} layers, "
+                      f"{self.tokens_per_frame} tokens/frame, budget={self.budget_ratio}")
+
         if self.mode == "causal":
-            # Apply compression if enabled
-            if self.use_kv_compression and self.tokens_per_frame is not None:
+            # Apply layer-wise compression (StreamVGGT algorithm)
+            if self.use_layerwise_eviction and self.layerwise_compressor is not None:
+                aggregator_kv_cache_list = self.layerwise_compressor.process_frame(
+                    aggregator_kv_cache_list,
+                    frame_idx=self.num_frames_processed
+                )
+            # Apply old compression if enabled
+            elif self.use_kv_compression and self.tokens_per_frame is not None:
                 aggregator_kv_cache_list = self._compress_aggregator_cache(aggregator_kv_cache_list)
 
             # Store cache (strip attention weights to save memory)
@@ -176,18 +215,22 @@ class StreamSession:
     def clear(self):
         self._clear_predictions()
         self._clear_cache()
+        if self.layerwise_compressor is not None:
+            self.layerwise_compressor.reset()
+        self.num_frames_processed = 0
 
     def forward_stream(self, images):
-        aggregator_kv_cache_list, camera_head_kv_cache_list = self._get_cache()
+        # aggregator_kv_cache_list, camera_head_kv_cache_list = self._get_cache()
 
         outputs = self.model(
             images=images, 
             mode=self.mode, 
-            aggregator_kv_cache_list=aggregator_kv_cache_list, 
-            camera_head_kv_cache_list=camera_head_kv_cache_list, 
+            aggregator_kv_cache_list=self.aggregator_kv_cache_list, 
+            camera_head_kv_cache_list=self.camera_head_kv_cache_list, 
         )
 
         self._update_predictions(outputs)
         self._update_cache(outputs["aggregator_kv_cache_list"], outputs["camera_head_kv_cache_list"])
+        self.num_frames_processed += 1
 
         return self.get_all_predictions()

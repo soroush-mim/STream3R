@@ -136,7 +136,6 @@ def save_ply(points, colors, filename):
 
 def test_compression(
     example_dir="examples/static_room",
-    num_frames=10,
     eviction_ratios=[0.0, 0.3, 0.5],
     mode="causal",
     model_path=None,
@@ -148,7 +147,6 @@ def test_compression(
 
     Args:
         example_dir: Directory with test images
-        num_frames: Number of frames to process
         eviction_ratios: List of eviction ratios to test
         mode: Attention mode ('causal' or 'window')
         model_path: Local path to pretrained model (optional)
@@ -173,7 +171,6 @@ def test_compression(
     # Load images
     print(f"\nLoading images from {example_dir}...")
     image_names = [os.path.join(example_dir, file) for file in sorted(os.listdir(example_dir))]
-    image_names = image_names[:num_frames]  # Limit to num_frames
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Loaded {images.shape[0]} frames")
 
@@ -191,6 +188,7 @@ def test_compression(
         session = StreamSession(
             model,
             mode=mode,
+            num_frames=images.shape[0],
             use_kv_compression=use_compression,
             eviction_ratio=eviction_ratio,
             importance_aggregation='sum'
@@ -377,7 +375,6 @@ if __name__ == "__main__":
         # Full comparison test
         results = test_compression(
             example_dir="examples/static_room",
-            num_frames=10,
             eviction_ratios=[0.0, 0.3, 0.5],
             mode="causal",
             model_path=model_path,

@@ -59,8 +59,10 @@ class Attention(nn.Module):
             k = self.rope(k, pos)
 
         if kv_cache is not None:
-            
-            k_cache, v_cache = kv_cache
+            if len(kv_cache) == 3:
+                k_cache, v_cache, attn_weights = kv_cache
+            else:
+                k_cache, v_cache = kv_cache
             if k_cache is not None and v_cache is not None:
                 k = torch.cat([k_cache, k], dim=2)
                 v = torch.cat([v_cache, v], dim=2)
@@ -91,8 +93,11 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
 
         if kv_cache is not None:
-            # Return [k, v, attn_weights] for token eviction
-            return x, [k, v, attn]
+            # Average attention across heads for token eviction
+            # attn shape: [B, num_heads, N, K] -> [B, N, K]
+            attn_avg = attn.mean(dim=1) if attn is not None else None
+            # Return [k, v, attn_avg] for token eviction
+            return x, [k, v, attn_avg]
 
         return x
 
