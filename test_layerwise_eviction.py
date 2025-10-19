@@ -16,6 +16,107 @@ from stream3r.stream_session import StreamSession
 from stream3r.models.components.utils.load_fn import load_and_preprocess_images
 
 
+def save_ply(points, colors, filename):
+    """
+    Save point cloud to PLY file.
+
+    Args:
+        points: [N, 3] numpy array of XYZ coordinates
+        colors: [N, 3] numpy array of RGB colors (0-255)
+        filename: Output PLY file path
+    """
+    assert points.shape[0] == colors.shape[0], "Points and colors must have same length"
+
+    with open(filename, 'w') as f:
+        # Write header
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        # Write vertices
+        for i in range(len(points)):
+            f.write(f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} ")
+            f.write(f"{colors[i, 0]} {colors[i, 1]} {colors[i, 2]}\n")
+
+
+def save_pointmap(predictions, output_dir, prefix="pointmap"):
+    """
+    Save point cloud from predictions to PLY file.
+
+    Args:
+        predictions: Dictionary with 'world_points', 'world_points_conf', 'images'
+        output_dir: Directory to save output files
+        prefix: Prefix for output filenames
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Extract data
+    world_points = predictions['world_points']  # [B, S, H, W, 3]
+    world_points_conf = predictions['world_points_conf']  # [B, S, H, W]
+    images = predictions['images']  # [B, S, 3, H, W]
+
+    B, S, H, W, _ = world_points.shape
+
+    # Convert to numpy
+    points = world_points.cpu().numpy()  # [B, S, H, W, 3]
+    conf = world_points_conf.cpu().numpy()  # [B, S, H, W]
+    imgs = images.cpu().numpy()  # [B, S, 3, H, W]
+
+    # Process each batch and sequence
+    for b in range(B):
+        for s in range(S):
+            # Get points for this frame
+            pts = points[b, s].reshape(-1, 3)  # [H*W, 3]
+            confidence = conf[b, s].reshape(-1)  # [H*W]
+
+            # Get RGB colors (convert from [3, H, W] to [H*W, 3])
+            rgb = imgs[b, s].transpose(1, 2, 0).reshape(-1, 3)  # [H*W, 3]
+            rgb = (rgb * 255).astype(np.uint8)  # Convert to 0-255
+
+            # Filter by confidence threshold
+            conf_threshold = 0.5
+            valid_mask = confidence > conf_threshold
+
+            pts_filtered = pts[valid_mask]
+            rgb_filtered = rgb[valid_mask]
+
+            # Save to PLY
+            output_file = os.path.join(output_dir, f"{prefix}_frame{s:03d}.ply")
+            save_ply(pts_filtered, rgb_filtered, output_file)
+
+    # Also save combined point cloud for all frames
+    all_points = []
+    all_colors = []
+
+    for b in range(B):
+        for s in range(S):
+            pts = points[b, s].reshape(-1, 3)
+            confidence = conf[b, s].reshape(-1)
+            rgb = imgs[b, s].transpose(1, 2, 0).reshape(-1, 3)
+            rgb = (rgb * 255).astype(np.uint8)
+
+            valid_mask = confidence > 0.5
+            all_points.append(pts[valid_mask])
+            all_colors.append(rgb[valid_mask])
+
+    if len(all_points) > 0:
+        all_points = np.concatenate(all_points, axis=0)
+        all_colors = np.concatenate(all_colors, axis=0)
+
+        combined_file = os.path.join(output_dir, f"{prefix}_combined.ply")
+        save_ply(all_points, all_colors, combined_file)
+        print(f"  → Saved combined pointmap: {combined_file} ({len(all_points)} points)")
+
+    return len(all_points) if len(all_points) > 0 else 0
+
+
 def get_cache_size_mb(session):
     """Calculate total memory used by KV cache in MB."""
     total_size = 0
@@ -42,6 +143,8 @@ def test_layerwise_vs_old(
     example_dir="examples/static_room",
     budget_ratios=[0.7, 0.5, 0.3],
     model_path=None,
+    output_dir="./output_layerwise_pointmaps",
+    save_pointmaps=True,
 ):
     """
     Compare layer-wise eviction with old method.
@@ -50,6 +153,8 @@ def test_layerwise_vs_old(
         example_dir: Directory with test images
         budget_ratios: List of budget ratios to test (P parameter)
         model_path: Local path to pretrained model
+        output_dir: Base directory to save point clouds
+        save_pointmaps: Whether to save point clouds
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -172,6 +277,17 @@ def test_layerwise_vs_old(
                   f"mean={np.mean(final_layer_counts):.1f}, "
                   f"std={np.std(final_layer_counts):.1f}")
 
+        # Save pointmaps for this configuration
+        if save_pointmaps:
+            # Create clean directory name from config name
+            config_dir_name = config['name'].replace(" ", "_").replace("(", "").replace(")", "").replace("=", "")
+            config_output_dir = os.path.join(output_dir, config_dir_name)
+
+            print(f"\n  Saving pointmaps to {config_output_dir}...")
+            final_predictions = session.get_all_predictions()
+            num_points = save_pointmap(final_predictions, config_output_dir, prefix=config_dir_name)
+            print(f"  ✓ Saved {num_frames} frame pointmaps and 1 combined ({num_points} total points)")
+
         session.clear()
 
     # Compare results
@@ -198,7 +314,7 @@ def test_layerwise_vs_old(
     return results
 
 
-def quick_test(model_path=None):
+def quick_test(model_path=None, save_pointmaps=False, output_dir="./output_quick_test"):
     """Quick test to verify layer-wise eviction works."""
     print("Running quick test of layer-wise eviction...")
 
@@ -237,6 +353,14 @@ def quick_test(model_path=None):
                   f"tokens L0={token_counts[0] if token_counts else 'N/A'}")
 
     print("✓ Quick test passed!")
+
+    # Save pointmaps if requested
+    if save_pointmaps:
+        print(f"\nSaving pointmaps to {output_dir}...")
+        final_predictions = session.get_all_predictions()
+        num_points = save_pointmap(final_predictions, output_dir, prefix="quick_test")
+        print(f"✓ Saved {num_frames} frame pointmaps and 1 combined ({num_points} total points)")
+
     session.clear()
 
 
@@ -244,19 +368,38 @@ if __name__ == "__main__":
     import sys
 
     model_path = None
+    save_pointmaps = False
+    output_dir = "./output_layerwise_pointmaps"
+
     if "--model_path" in sys.argv:
         idx = sys.argv.index("--model_path")
         if idx + 1 < len(sys.argv):
             model_path = sys.argv[idx + 1]
             print(f"Using model from: {model_path}")
 
+    if "--save_pointmaps" in sys.argv:
+        save_pointmaps = True
+        print("Will save pointmaps to PLY files")
+
+    if "--output_dir" in sys.argv:
+        idx = sys.argv.index("--output_dir")
+        if idx + 1 < len(sys.argv):
+            output_dir = sys.argv[idx + 1]
+            print(f"Output directory: {output_dir}")
+
     if "quick" in sys.argv:
         # Quick test
-        quick_test(model_path=model_path)
+        quick_test(
+            model_path=model_path,
+            save_pointmaps=save_pointmaps,
+            output_dir=output_dir if save_pointmaps else "./output_quick_test"
+        )
     else:
         # Full comparison test
         results = test_layerwise_vs_old(
             example_dir="examples/static_room",
-            budget_ratios=[0.3, 0.5],
-            model_path=model_path
+            budget_ratios=[0.1,0.3, 0.5],
+            model_path=model_path,
+            output_dir=output_dir,
+            save_pointmaps=save_pointmaps
         )
