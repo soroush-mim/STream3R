@@ -184,13 +184,24 @@ def test_layerwise_vs_old(
     ]
 
     # Add layer-wise configs
+    # for budget_ratio in budget_ratios:
+    #     configs.append({
+    #         "name": f"LayerWise (P={budget_ratio})",
+    #         "use_layerwise": True,
+    #         "use_old": False,
+    #         "budget_ratio": budget_ratio
+    #     })
+
     for budget_ratio in budget_ratios:
         configs.append({
-            "name": f"LayerWise (P={budget_ratio})",
+            "name": f"D2O (P={budget_ratio}, merge, beta={0.7})",
             "use_layerwise": True,
             "use_old": False,
-            "budget_ratio": budget_ratio
+            "budget_ratio": budget_ratio,
+            "enable_token_merging": True,
+            "merge_beta": 0.7
         })
+
 
     results = {}
 
@@ -208,7 +219,9 @@ def test_layerwise_vs_old(
             eviction_ratio=config.get("eviction_ratio", 0.3),
             use_layerwise_eviction=config.get("use_layerwise", False),
             budget_ratio=config.get("budget_ratio", 0.5),
-            temp=1.0
+            temp=1.0,
+            enable_token_merging=config.get("enable_token_merging", False),
+            merge_beta=config.get("merge_beta", 0.7)
         )
 
         # Process frames
@@ -398,7 +411,7 @@ if __name__ == "__main__":
         # Full comparison test
         results = test_layerwise_vs_old(
             example_dir="examples/static_room",
-            budget_ratios=[0.1,0.3, 0.5],
+            budget_ratios=[0.5 , 0.3],
             model_path=model_path,
             output_dir=output_dir,
             save_pointmaps=save_pointmaps

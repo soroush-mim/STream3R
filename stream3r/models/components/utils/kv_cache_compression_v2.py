@@ -12,6 +12,10 @@ Implements:
 2. Exposure count tracking per layer
 3. Variance-based layer importance computation
 4. Per-layer token eviction with special token protection
+5. Optional D2O-style token merging with:
+   - Nearest neighbor matching using cosine similarity
+   - EMA threshold for merge/discard decision
+   - Weighted token merging based on similarity
 """
 
 import torch
@@ -39,7 +43,9 @@ class LayerWiseKVCompression:
         total_frames: int,
         budget_ratio: float = 0.5,
         temp: float = 0.5,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        enable_token_merging: bool = False,
+        merge_beta: float = 0.7
     ):
         """
         Initialize layer-wise KV compression manager.
@@ -52,6 +58,8 @@ class LayerWiseKVCompression:
             budget_ratio: P in formula - percentage of total frames to keep (0.5 = 50% budget)
             temp: Temperature for softmax in layer importance computation
             device: Device to store tensors
+            enable_token_merging: Whether to enable D2O token merging (default: False)
+            merge_beta: EMA smoothing constant for token merging threshold (default: 0.7)
         """
         self.num_layers = num_layers
         self.tokens_per_frame = tokens_per_frame
@@ -60,6 +68,8 @@ class LayerWiseKVCompression:
         self.budget_ratio = budget_ratio
         self.temp = temp
         self.device = device
+        self.enable_token_merging = enable_token_merging
+        self.merge_beta = merge_beta
 
         # Per-layer cumulative attention maps (CAM)
         # Each will be a 1D tensor of shape [num_tokens_in_cache]
@@ -71,6 +81,9 @@ class LayerWiseKVCompression:
 
         # Track current frame index
         self.current_frame = 0
+
+        # Token merging: EMA threshold per layer
+        self.ema_thresholds: List[Optional[float]] = [None] * num_layers
 
     def initialize_first_frame(self, attn_maps_layers: List[torch.Tensor]):
         """
@@ -269,19 +282,181 @@ class LayerWiseKVCompression:
         print(f"✓ Computed removal indices: {total_evicted} tokens to evict")
         return removal_indices
 
+    def nearest_neighbor_matching(
+        self,
+        K_evicted: torch.Tensor,
+        K_conserved: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute nearest neighbor matching between evicted and conserved tokens.
+        Based on D2O paper Section 4.2.2, Equation 9.
+
+        Args:
+            K_evicted: Evicted key tokens [L_e, D]
+            K_conserved: Conserved key tokens [L_c, D]
+
+        Returns:
+            similarity_matrix: Cosine similarity matrix [L_e, L_c]
+            nearest_indices: Index of nearest conserved token for each evicted token [L_e]
+        """
+        # Compute cosine similarity: u_i,j = (k_i^T * k_j) / (||k_i|| ||k_j||)
+        K_evicted_norm = F.normalize(K_evicted, p=2, dim=-1)  # [L_e, D]
+        K_conserved_norm = F.normalize(K_conserved, p=2, dim=-1)  # [L_c, D]
+
+        similarity_matrix = torch.matmul(K_evicted_norm, K_conserved_norm.T)  # [L_e, L_c]
+
+        # Find nearest neighbor for each evicted token
+        nearest_indices = torch.argmax(similarity_matrix, dim=1)  # [L_e]
+
+        return similarity_matrix, nearest_indices
+
+    def update_ema_threshold(
+        self,
+        similarity_matrix: torch.Tensor,
+        layer_idx: int,
+        is_first_frame: bool = False
+    ) -> float:
+        """
+        Update EMA threshold for token merging decision.
+        Based on D2O paper Section 4.2.2, Equation 10.
+
+        Args:
+            similarity_matrix: Similarity matrix [L_e, L_c] or [L_c]
+            layer_idx: Current layer index
+            is_first_frame: Whether this is the first eviction (not frame 0, but first
+                            frame where eviction actually occurs, typically frame 1)
+
+        Returns:
+            Current threshold value
+
+        Note:
+            - First eviction: τ_0 = (1/L_e) * Σ Max(U_0[i,:])
+            - Subsequent: τ_t = β*Max(U_t[:]) + (1-β)*τ_(t-1)
+        """
+        if is_first_frame:
+            # τ_0 = (1/L_e) * sum(Max(U_t[i,:]))
+            if similarity_matrix.dim() == 2:
+                max_similarities = torch.max(similarity_matrix, dim=1)[0]  # [L_e]
+                threshold = max_similarities.mean().item()
+            else:
+                threshold = similarity_matrix.max().item()
+            self.ema_thresholds[layer_idx] = threshold
+        else:
+            # τ_t = β*Max(U_t[:]) + (1-β)*τ_{t-1}
+            current_max = similarity_matrix.max().item()
+            prev_threshold = self.ema_thresholds[layer_idx]
+            if prev_threshold is None:
+                threshold = current_max
+            else:
+                threshold = self.merge_beta * current_max + (1 - self.merge_beta) * prev_threshold
+            self.ema_thresholds[layer_idx] = threshold
+
+        return threshold
+        
+    @torch.no_grad()
+    def weighted_token_merging(
+        self,
+        K_conserved: torch.Tensor,
+        V_conserved: torch.Tensor,
+        K_evicted: torch.Tensor,
+        V_evicted: torch.Tensor,
+        similarity_matrix: torch.Tensor,
+        nearest_indices: torch.Tensor,
+        threshold: float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Merge evicted tokens into conserved tokens using weighted merging.
+        Based on D2O paper Section 4.2.2, Equations 11 and 12.
+
+        Args:
+            K_conserved: Conserved key tokens [L_c, D]
+            V_conserved: Conserved value tokens [L_c, D]
+            K_evicted: Evicted key tokens [L_e, D]
+            V_evicted: Evicted value tokens [L_e, D]
+            similarity_matrix: Similarity matrix [L_e, L_c]
+            nearest_indices: Nearest conserved token for each evicted token [L_e]
+            threshold: EMA threshold for merging decision
+
+        Returns:
+            K_merged: Merged key tokens [L_c, D]
+            V_merged: Merged value tokens [L_c, D]
+        """
+        L_c = K_conserved.shape[0]
+
+        # Get max similarity for each evicted token
+        max_similarities = torch.max(similarity_matrix, dim=1)[0]  # [L_e]
+
+        # Create mask: only merge tokens above threshold
+        merge_mask = max_similarities >= threshold  # [L_e]
+
+        if merge_mask.sum() == 0:
+            # No tokens to merge
+            return K_conserved.clone(), V_conserved.clone()
+
+        # Filter tokens to merge
+        K_evicted_merge = K_evicted[merge_mask]  # [L_merge, D]
+        V_evicted_merge = V_evicted[merge_mask]  # [L_merge, D]
+        nearest_indices_merge = nearest_indices[merge_mask]  # [L_merge]
+        similarity_matrix_merge = similarity_matrix[merge_mask]  # [L_merge, L_c]
+
+        L_merge = K_evicted_merge.shape[0]
+
+        # Create matching mask matrix: m_ij = 1 if j is nearest to i, else 0
+        match_mask = torch.zeros(L_merge, L_c, device=K_conserved.device)
+        match_mask[torch.arange(match_mask.shape[0], device=K_conserved.device), nearest_indices_merge] = 1.0
+
+        # Compute weighted merging weights (Equation 12)
+        # w_ei = sum(exp(u_ij)*m_ij) / (sum(exp(u_ij)*m_ij) + e)
+        # w_cj = e / (sum(exp(u_ij)*m_ij) + e)
+
+        exp_sim = torch.exp(similarity_matrix_merge)  # [L_merge, L_c]
+        weighted_exp_sim = exp_sim * match_mask  # [L_merge, L_c]
+
+        # Sum over evicted tokens for each conserved token
+        sum_weighted = weighted_exp_sim.sum(dim=0)  # [L_c]
+
+        e = torch.e
+        w_conserved = e / (sum_weighted + e)  # [L_c]
+
+        # Compute weights for each evicted token
+        w_evicted = weighted_exp_sim / (weighted_exp_sim.sum(dim=1, keepdim=True) + e)  # [L_merge, L_c]
+
+        # Clone for merging
+        K_merged = K_conserved.clone()
+        V_merged = V_conserved.clone()
+
+        # Apply weighted merging (Equation 11)
+        # k_cj = w_cj*k_cj + sum(w_ei*k_ei)
+        # v_cj = w_cj*v_cj + sum(w_ei*v_ei)
+
+        K_merged = K_merged * w_conserved.unsqueeze(1)  # [L_c, D]
+        V_merged = V_merged * w_conserved.unsqueeze(1)  # [L_c, D]
+
+        # Add weighted contributions from evicted tokens
+        K_contribution = torch.matmul(w_evicted.T, K_evicted_merge)  # [L_c, D]
+        V_contribution = torch.matmul(w_evicted.T, V_evicted_merge)  # [L_c, D]
+
+        K_merged = K_merged + K_contribution
+        V_merged = V_merged + V_contribution
+
+        return K_merged, V_merged
+
     def compact_kv_cache(
         self,
         kv_cache_list: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
-        removal_indices_per_layer: List[Optional[torch.Tensor]]
+        removal_indices_per_layer: List[Optional[torch.Tensor]],
+        is_first_frame: bool = False
     ) -> List[Tuple[torch.Tensor, torch.Tensor, None]]:
         """
         Remove tokens from KV cache and update CAM/exposure accordingly.
+        Optionally apply D2O token merging.
 
         Args:
             kv_cache_list: List of (K, V, attn) tuples per layer
                 K, V: [B, H, T, D]
                 attn: not used (set to None after eviction)
             removal_indices_per_layer: Indices to remove per layer
+            is_first_frame: Whether this is the first frame (for EMA threshold init)
 
         Returns:
             Compacted KV cache list with updated (K, V, None)
@@ -305,14 +480,50 @@ class LayerWiseKVCompression:
             keep_mask[rem_indices] = False
             keep_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(1)
 
-            # Compact K and V
-            K_new = K.index_select(2, keep_indices)
-            V_new = V.index_select(2, keep_indices)
+            # Apply token merging if enabled (D2O)
+            if self.enable_token_merging:
+                # Reshape K and V for token merging: [B, H, T, D] -> [T, B*H*D]
+                K_flat = K.permute(2, 0, 1, 3).reshape(T, -1)  # [T, B*H*D]
+                V_flat = V.permute(2, 0, 1, 3).reshape(T, -1)  # [T, B*H*D]
+
+                # Get evicted and conserved tokens
+                K_evicted = K_flat[rem_indices]  # [L_e, B*H*D]
+                V_evicted = V_flat[rem_indices]  # [L_e, B*H*D]
+                K_conserved = K_flat[keep_indices]  # [L_c, B*H*D]
+                V_conserved = V_flat[keep_indices]  # [L_c, B*H*D]
+
+                # Perform nearest neighbor matching
+                similarity_matrix, nearest_indices = self.nearest_neighbor_matching(
+                    K_evicted, K_conserved
+                )
+
+                # Update EMA threshold
+                threshold = self.update_ema_threshold(
+                    similarity_matrix, layer_idx, is_first_frame
+                )
+
+                # Perform weighted token merging
+                K_merged, V_merged = self.weighted_token_merging(
+                    K_conserved, V_conserved,
+                    K_evicted, V_evicted,
+                    similarity_matrix, nearest_indices,
+                    threshold
+                )
+
+                # Reshape back to [B, H, T', D]
+                T_new = K_merged.shape[0]
+                K_new = K_merged.reshape(T_new, B, H, D).permute(1, 2, 0, 3)  # [B, H, T', D]
+                V_new = V_merged.reshape(T_new, B, H, D).permute(1, 2, 0, 3)  # [B, H, T', D]
+
+
+            else:
+                # Standard eviction without merging
+                K_new = K.index_select(2, keep_indices)
+                V_new = V.index_select(2, keep_indices)
 
             # Update CAM and exposure
             cam = self.cum_attn_maps[layer_idx]
             exp = self.exposure_counts[layer_idx]
-
             cam_new = cam.index_select(0, keep_indices)
             exp_new = exp.index_select(0, keep_indices)
 
@@ -322,7 +533,7 @@ class LayerWiseKVCompression:
             compacted_cache.append((K_new, V_new, None))
 
             # Cleanup
-            del K, V, keep_mask, keep_indices, cam, exp
+            del K, V, keep_mask, keep_indices
 
         torch.cuda.empty_cache()
         return compacted_cache
@@ -370,8 +581,13 @@ class LayerWiseKVCompression:
         # Compute removal indices
         removal_indices = self.get_removal_indices_per_layer(tk_rm_num_per_layer, frame_idx)
 
-        # Compact KV cache
-        compacted_cache = self.compact_kv_cache(kv_cache_list, removal_indices)
+        # Determine if this is first eviction (for EMA threshold initialization)
+        # Frame 1 is first eviction since frame 0 is protected
+        is_first_eviction = (frame_idx == 1)
+
+        # Compact KV cache (with optional token merging)
+        compacted_cache = self.compact_kv_cache(kv_cache_list, removal_indices,
+                                                is_first_frame=is_first_eviction)
 
         return compacted_cache
 
@@ -379,5 +595,6 @@ class LayerWiseKVCompression:
         """Reset all state for a new sequence."""
         self.cum_attn_maps = [None] * self.num_layers
         self.exposure_counts = [None] * self.num_layers
+        self.ema_thresholds = [None] * self.num_layers
         self.current_frame = 0
         print("✓ Reset compression state")

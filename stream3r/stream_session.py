@@ -18,6 +18,8 @@ class StreamSession:
         use_layerwise_eviction: bool = False,
         budget_ratio: float = 0.5,
         temp: float = 0.5,
+        enable_token_merging: bool = False,
+        merge_beta: float = 0.7,
     ):
         """
         Initialize streaming session with optional KV cache compression.
@@ -32,6 +34,8 @@ class StreamSession:
             use_layerwise_eviction: Use StreamVGGT-style layer-wise eviction (recommended)
             budget_ratio: P in formula - percentage of total frames to keep (0.5 = 50% budget)
             temp: Temperature for layer importance softmax
+            enable_token_merging: Whether to enable D2O token merging (default: False)
+            merge_beta: EMA smoothing constant for token merging threshold (default: 0.7)
         """
         self.model = model
         self.mode = mode
@@ -49,6 +53,8 @@ class StreamSession:
         self.use_layerwise_eviction = use_layerwise_eviction
         self.budget_ratio = budget_ratio
         self.temp = temp
+        self.enable_token_merging = enable_token_merging
+        self.merge_beta = merge_beta
 
         # Calculate tokens per frame based on model configuration
         # This will be set after first forward pass when we know image size
@@ -141,7 +147,9 @@ class StreamSession:
                     total_frames=self.num_frames,
                     budget_ratio=self.budget_ratio,
                     temp=self.temp,
-                    device=device
+                    device=device,
+                    enable_token_merging=self.enable_token_merging,
+                    merge_beta=self.merge_beta
                 )
                 print(f"✓ Initialized LayerWiseKVCompression: {self.aggregator_kv_cache_depth} layers, "
                       f"{self.tokens_per_frame} tokens/frame, budget={self.budget_ratio}")
